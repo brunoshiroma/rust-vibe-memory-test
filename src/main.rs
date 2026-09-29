@@ -17,7 +17,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--sizes" => {
-                let value = args.next().ok_or("--sizes requires a comma-separated list")?;
+                let value = args
+                    .next()
+                    .ok_or("--sizes requires a comma-separated list")?;
                 config.sizes_bytes = value
                     .split(',')
                     .map(parse_size)
@@ -50,12 +52,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_measurement(result: &Measurement) {
     println!(
-        "{:<16} {:>9} {:>2} {:>12} {:>14} {:>14.2} {:>14.2}",
+        "{:<16} {:>12} {:>12} {:>14.2} {:>14.2}",
         result.operation.name(),
         format_size(result.size_bytes),
-        "",
         result.iterations,
-        "",
         result.bytes_per_second / 1_000_000_000.0,
         result.nanoseconds_per_element
     );

@@ -1,3 +1,5 @@
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -9,7 +11,13 @@ pub struct BenchmarkConfig {
 impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
-            sizes_bytes: vec![4 * 1024, 32 * 1024, 256 * 1024, 2 * 1024 * 1024, 16 * 1024 * 1024],
+            sizes_bytes: vec![
+                4 * 1024,
+                32 * 1024,
+                256 * 1024,
+                2 * 1024 * 1024,
+                16 * 1024 * 1024,
+            ],
             iterations: 20,
         }
     }
@@ -44,6 +52,43 @@ pub struct Measurement {
     pub nanoseconds_per_element: f64,
 }
 
+struct Timer {
+    #[cfg(not(target_arch = "wasm32"))]
+    started: Instant,
+    #[cfg(target_arch = "wasm32")]
+    started_millis: f64,
+}
+
+impl Timer {
+    fn start() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self {
+                started: Instant::now(),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self {
+                started_millis: wasm::performance_now(),
+            }
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.started.elapsed()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Duration::from_secs_f64(
+                ((wasm::performance_now() - self.started_millis) / 1000.0).max(0.0),
+            )
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BenchmarkError {
     NoSizes,
@@ -57,7 +102,10 @@ impl std::fmt::Display for BenchmarkError {
             Self::NoSizes => write!(f, "at least one working-set size is required"),
             Self::ZeroIterations => write!(f, "iterations must be greater than zero"),
             Self::InvalidSize(size) => {
-                write!(f, "working-set size {size} must be at least 8 and divisible by 8")
+                write!(
+                    f,
+                    "working-set size {size} must be at least 8 and divisible by 8"
+                )
             }
         }
     }
@@ -88,7 +136,7 @@ pub fn run_suite(config: &BenchmarkConfig) -> Result<Vec<Measurement>, Benchmark
             }
         }
 
-        let start = Instant::now();
+        let start = Timer::start();
         let mut checksum = 0_u64;
         for _ in 0..config.iterations {
             for &value in &source {
@@ -105,7 +153,7 @@ pub fn run_suite(config: &BenchmarkConfig) -> Result<Vec<Measurement>, Benchmark
             size_bytes,
         ));
 
-        let start = Instant::now();
+        let start = Timer::start();
         for iteration in 0..config.iterations {
             for (index, value) in destination.iter_mut().enumerate() {
                 *value = std::hint::black_box((index as u64).wrapping_add(iteration as u64));
@@ -121,7 +169,7 @@ pub fn run_suite(config: &BenchmarkConfig) -> Result<Vec<Measurement>, Benchmark
             size_bytes,
         ));
 
-        let start = Instant::now();
+        let start = Timer::start();
         for _ in 0..config.iterations {
             destination.copy_from_slice(std::hint::black_box(&source));
             std::hint::black_box(&destination);
@@ -136,7 +184,7 @@ pub fn run_suite(config: &BenchmarkConfig) -> Result<Vec<Measurement>, Benchmark
         ));
 
         let next = make_pointer_chase_ring(words);
-        let start = Instant::now();
+        let start = Timer::start();
         let mut index = 0;
         for _ in 0..config.iterations.saturating_mul(words) {
             index = std::hint::black_box(next[index]);
@@ -162,7 +210,7 @@ fn measurement(
     elapsed: std::time::Duration,
     transferred_bytes_per_iteration: usize,
 ) -> Measurement {
-    let elapsed_seconds = elapsed.as_secs_f64();
+    let elapsed_seconds = elapsed.as_secs_f64().max(1e-9);
     let elapsed_for_division = elapsed_seconds.max(f64::MIN_POSITIVE);
     let total_elements = elements_per_iteration.saturating_mul(iterations);
     let total_bytes = transferred_bytes_per_iteration.saturating_mul(iterations);
@@ -178,30 +226,33 @@ fn measurement(
 }
 
 fn make_pointer_chase_ring(len: usize) -> Vec<usize> {
-    let stride = (1..len)
-        .find(|stride| gcd(*stride, len) == 1)
-        .unwrap_or(0);
-    let mut next = vec![0; len];
-    let mut current = 0;
-    for _ in 0..len {
-        let following = (current + stride) % len;
-        next[current] = following;
-        current = following;
+    let mut order = (0..len).collect::<Vec<_>>();
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for index in (1..len).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        order.swap(index, (state as usize) % (index + 1));
     }
-    next
-}
 
-fn gcd(mut left: usize, mut right: usize) -> usize {
-    while right != 0 {
-        (left, right) = (right, left % right);
+    let mut next = vec![0; len];
+    for pair in order.windows(2) {
+        next[pair[0]] = pair[1];
     }
-    left
+    next[*order.last().expect("working set is non-empty")] = order[0];
+    next
 }
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use super::{BenchmarkConfig, run_suite};
     use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_namespace = performance, js_name = now)]
+        pub(super) fn performance_now() -> f64;
+    }
 
     #[wasm_bindgen]
     pub fn run_memory_benchmark(size_bytes: u32, iterations: u32) -> Result<String, JsValue> {
@@ -245,7 +296,10 @@ mod tests {
 
         assert_eq!(results.len(), 8);
         assert_eq!(
-            results.iter().map(|item| item.operation).collect::<Vec<_>>(),
+            results
+                .iter()
+                .map(|item| item.operation)
+                .collect::<Vec<_>>(),
             vec![
                 Operation::Read,
                 Operation::Write,
@@ -286,5 +340,21 @@ mod tests {
             .unwrap_err(),
             BenchmarkError::InvalidSize(7)
         );
+    }
+
+    #[test]
+    fn pointer_chase_ring_visits_every_entry_once() {
+        let ring = make_pointer_chase_ring(17);
+        let mut visited = vec![false; ring.len()];
+        let mut index = 0;
+
+        for _ in 0..ring.len() {
+            assert!(!visited[index]);
+            visited[index] = true;
+            index = ring[index];
+        }
+
+        assert_eq!(index, 0);
+        assert!(visited.into_iter().all(|item| item));
     }
 }
