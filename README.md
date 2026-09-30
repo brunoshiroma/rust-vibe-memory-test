@@ -26,6 +26,10 @@ The generated package exports `run_memory_benchmark(size_bytes, iterations)`, wh
 
 The benchmark core is a Rust library and can be cross-compiled for Android and iOS Rust targets, then called from a native application through the platform's Rust FFI integration. Install the relevant Rust target and native SDK/toolchain first. The command-line executable is intended for desktop use; this repository does not include mobile app shells or platform-specific packaging.
 
+## Desktop release binaries
+
+Pushing any Git tag creates a GitHub release with packaged command-line binaries. The workflow builds Linux for x86, x64, ARM32, ARM64, and RISC-V 64-bit; Windows for x86, x64, and ARM64; and macOS for x64 and ARM64. Windows ARM32/RISC-V and macOS x86/ARM32/RISC-V are not included because Rust does not provide supported desktop targets for those combinations.
+
 ## Toolchain
 
 `rust-toolchain.toml` tracks the latest stable Rust toolchain. Cross-compiling requires the target's Rust standard library and platform linker/SDK.
