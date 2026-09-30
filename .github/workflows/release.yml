@@ -1,0 +1,122 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Linux (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: i686-unknown-linux-gnu
+            linker: gcc
+            packages: gcc-multilib
+          - target: x86_64-unknown-linux-gnu
+            linker: gcc
+            packages: ""
+          - target: armv7-unknown-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
+            packages: gcc-arm-linux-gnueabihf
+          - target: aarch64-unknown-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+            packages: gcc-aarch64-linux-gnu
+          - target: riscv64gc-unknown-linux-gnu
+            linker: riscv64-linux-gnu-gcc
+            packages: gcc-riscv64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross-linker
+        if: matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ${{ matrix.packages }}
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Configure target linker
+        shell: bash
+        run: |
+          target_env=$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')
+          echo "CARGO_TARGET_${target_env}_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
+      - name: Build binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package binary
+        run: tar -czf memory-cache-bench-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release memory-cache-bench
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memory-cache-bench-${{ matrix.target }}
+          path: memory-cache-bench-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows (${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - i686-pc-windows-msvc
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build and package binary
+        shell: pwsh
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }}
+          $archive = "memory-cache-bench-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/memory-cache-bench.exe" -DestinationPath $archive
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memory-cache-bench-${{ matrix.target }}
+          path: memory-cache-bench-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  build-macos:
+    name: macOS (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package binary
+        run: tar -czf memory-cache-bench-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release memory-cache-bench
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memory-cache-bench-${{ matrix.target }}
+          path: memory-cache-bench-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub release
+    needs:
+      - build-linux
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
