@@ -130,20 +130,18 @@ pub fn run_suite(config: &BenchmarkConfig) -> Result<Vec<Measurement>, Benchmark
         let mut source = vec![0_u64; words];
         let mut destination = vec![0_u64; words];
 
-        for iteration in 0..config.iterations {
-            for (index, value) in source.iter_mut().enumerate() {
-                *value = std::hint::black_box((index as u64).wrapping_add(iteration as u64));
-            }
+        for (index, value) in source.iter_mut().enumerate() {
+            *value = index as u64;
         }
 
         let start = Timer::start();
-        let mut checksum = 0_u64;
         for _ in 0..config.iterations {
-            for &value in &source {
-                checksum = checksum.wrapping_add(std::hint::black_box(value));
-            }
+            let checksum = std::hint::black_box(source.as_slice())
+                .iter()
+                .copied()
+                .fold(0_u64, u64::wrapping_add);
+            std::hint::black_box(checksum);
         }
-        std::hint::black_box(checksum);
         measurements.push(measurement(
             Operation::Read,
             size_bytes,
@@ -155,9 +153,7 @@ pub fn run_suite(config: &BenchmarkConfig) -> Result<Vec<Measurement>, Benchmark
 
         let start = Timer::start();
         for iteration in 0..config.iterations {
-            for (index, value) in destination.iter_mut().enumerate() {
-                *value = std::hint::black_box((index as u64).wrapping_add(iteration as u64));
-            }
+            destination.fill(std::hint::black_box(iteration as u64));
             std::hint::black_box(&destination);
         }
         measurements.push(measurement(
