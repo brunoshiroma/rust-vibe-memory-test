@@ -12,6 +12,12 @@ cargo test
 
 Choose working-set sizes around the cache capacities you want to investigate. The program does not identify cache levels or guarantee that a size fits in a particular cache: cache topology and behavior depend on the processor and system. Run several times on an otherwise idle device and compare results.
 
+`--iterations` is a lower bound, not an exact count. A short run over a small working set finishes in a few microseconds, which is below the noise floor of the system timer, so every operation first runs once untimed to warm caches and then repeats until it has been timed for at least 50 ms. The `iterations` column reports the passes that were actually timed. Set `min_measure_seconds` to `0.0` through the library API to time exactly `--iterations` passes.
+
+Release builds target the generic architecture, so the vector width of `read` and `write` follows the baseline instruction set rather than the host CPU. Rebuild with `RUSTFLAGS="-C target-cpu=native"` to measure the widest vectors the local processor supports; on an AVX2 machine that is roughly 3x the read and write throughput of a default x86-64 build. The released binaries keep the portable baseline so they run on any machine of their architecture.
+
+`copy` places its source and destination at the same offset within their page and keeps them cache-line aligned. Anything else makes the two lockstep streams disagree in the low address bits, which measured about 20x slower below 64 KiB and 6x slower from 1 MiB upwards.
+
 ## WebAssembly
 
 Install the `wasm32-unknown-unknown` Rust target and `wasm-pack`, then build:

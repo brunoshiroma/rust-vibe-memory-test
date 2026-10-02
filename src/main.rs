@@ -95,7 +95,10 @@ fn print_help() {
         "Memory and cache benchmark\n\n\
          Usage: memory-cache-bench [--sizes SIZE[,SIZE...]] [--iterations COUNT]\n\n\
          Sizes accept bytes, KiB, MiB, or GiB (for example: 16KiB,256KiB,8MiB).\n\
-         Defaults: 4KiB,32KiB,256KiB,2MiB,16MiB and 20 iterations."
+         Defaults: 4KiB,32KiB,256KiB,2MiB,16MiB and 20 iterations.\n\n\
+         COUNT is a lower bound: every operation repeats until it has been timed\n\
+         for at least 50 ms, so small working sets stay measurable. The reported\n\
+         iteration count is the number of passes that were actually timed."
     );
 }
 
