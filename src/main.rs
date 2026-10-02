@@ -31,6 +31,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("--iterations requires a positive integer")?
                     .parse()?;
             }
+            "--threads" => {
+                config.threads = args
+                    .next()
+                    .ok_or("--threads requires a positive integer")?
+                    .parse()?;
+            }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -41,8 +47,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let measurements = run_suite(&config)?;
     println!(
-        "{:<16} {:>12} {:>12} {:>14} {:>14}",
-        "operation", "working set", "iterations", "GB/s", "ns/element"
+        "{:<16} {:>12} {:>10} {:>8} {:>14} {:>14}",
+        "operation", "working set", "threads", "passes", "GB/s", "ns/element"
     );
     for result in &measurements {
         print_measurement(result);
@@ -52,9 +58,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_measurement(result: &Measurement) {
     println!(
-        "{:<16} {:>12} {:>12} {:>14.2} {:>14.2}",
+        "{:<16} {:>12} {:>10} {:>8} {:>14.2} {:>14.2}",
         result.operation.name(),
         format_size(result.size_bytes),
+        result.threads,
         result.iterations,
         result.bytes_per_second / 1_000_000_000.0,
         result.nanoseconds_per_element
@@ -93,12 +100,17 @@ fn format_size(bytes: usize) -> String {
 fn print_help() {
     println!(
         "Memory and cache benchmark\n\n\
-         Usage: memory-cache-bench [--sizes SIZE[,SIZE...]] [--iterations COUNT]\n\n\
+         Usage: memory-cache-bench [--sizes SIZE[,SIZE...]] [--iterations COUNT]\n\
+         \x20                      [--threads COUNT]\n\n\
          Sizes accept bytes, KiB, MiB, or GiB (for example: 16KiB,256KiB,8MiB).\n\
          Defaults: 4KiB,32KiB,256KiB,2MiB,16MiB and 20 iterations.\n\n\
-         COUNT is a lower bound: every operation repeats until it has been timed\n\
-         for at least 50 ms, so small working sets stay measurable. The reported\n\
-         iteration count is the number of passes that were actually timed."
+         COUNT for --iterations is a lower bound: every operation repeats until\n\
+         it has been timed for at least 50 ms, so small working sets stay\n\
+         measurable. The reported pass count is what was actually timed.\n\n\
+         --threads gives each thread a private working set and drives them in\n\
+         lockstep, so throughput is the aggregate. One stream cannot saturate\n\
+         DRAM; raise --threads to measure system memory bandwidth. It holds\n\
+         threads * 2 * size_bytes of buffers, so lower --sizes first."
     );
 }
 

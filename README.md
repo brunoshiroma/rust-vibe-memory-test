@@ -7,6 +7,7 @@ Rust benchmark for comparing memory working sets on Linux, Windows, macOS, Andro
 ```sh
 cargo run --release
 cargo run --release -- --sizes 16KiB,32KiB,256KiB,2MiB,16MiB --iterations 50
+cargo run --release -- --sizes 256MiB --threads 4
 cargo test
 ```
 
@@ -17,6 +18,16 @@ Choose working-set sizes around the cache capacities you want to investigate. Th
 Release builds target the generic architecture, so the vector width of `read` and `write` follows the baseline instruction set rather than the host CPU. Rebuild with `RUSTFLAGS="-C target-cpu=native"` to measure the widest vectors the local processor supports; on an AVX2 machine that is roughly 3x the read and write throughput of a default x86-64 build. The released binaries keep the portable baseline so they run on any machine of their architecture.
 
 `copy` places its source and destination at the same offset within their page and keeps them cache-line aligned. Anything else makes the two lockstep streams disagree in the low address bits, which measured about 20x slower below 64 KiB and 6x slower from 1 MiB upwards.
+
+## Threads and memory bandwidth
+
+`--threads` gives each thread a private working set and drives them in lockstep, so the reported throughput is the aggregate. It defaults to 1.
+
+One stream cannot saturate DRAM. A single core is limited by its own load/store throughput and prefetcher, so on a four-core machine a 256 MiB read measures roughly 27 GB/s on one thread and 89 GB/s on four. If you are trying to answer "how fast is this machine's memory", raise `--threads` until the curve flattens; if you are characterizing a cache hierarchy, keep it at 1 so each measurement is attributable to one core.
+
+Each thread holds its own source and destination, so a run allocates `threads * 2 * size_bytes` bytes of buffers plus, for the pointer chase, `threads * size_bytes` more. Lower `--sizes` before raising `--threads` on a memory-constrained machine.
+
+Threads are native-only; the WebAssembly build always runs single-threaded.
 
 ## WebAssembly
 

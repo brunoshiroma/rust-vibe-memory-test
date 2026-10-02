@@ -18,6 +18,11 @@ pub struct BenchmarkConfig {
     /// Minimum timed duration per measurement. `0.0` times exactly
     /// `iterations` passes.
     pub min_measure_seconds: f64,
+    /// Number of threads to drive. Each thread gets a private working set of
+    /// `size_bytes`, so a run holds `threads * 2 * size_bytes` bytes of buffers.
+    /// One stream cannot saturate DRAM, so raising this is how the suite
+    /// reports aggregate memory bandwidth rather than per-core bandwidth.
+    pub threads: usize,
 }
 
 impl Default for BenchmarkConfig {
@@ -32,6 +37,7 @@ impl Default for BenchmarkConfig {
             ],
             iterations: 20,
             min_measure_seconds: MIN_MEASURE_SECONDS,
+            threads: 1,
         }
     }
 }
@@ -60,6 +66,7 @@ pub struct Measurement {
     pub operation: Operation,
     pub size_bytes: usize,
     pub iterations: usize,
+    pub threads: usize,
     pub elapsed_seconds: f64,
     pub bytes_per_second: f64,
     pub nanoseconds_per_element: f64,
@@ -106,6 +113,7 @@ impl Timer {
 pub enum BenchmarkError {
     NoSizes,
     ZeroIterations,
+    ZeroThreads,
     InvalidSize(usize),
 }
 
@@ -114,6 +122,7 @@ impl std::fmt::Display for BenchmarkError {
         match self {
             Self::NoSizes => write!(f, "at least one working-set size is required"),
             Self::ZeroIterations => write!(f, "iterations must be greater than zero"),
+            Self::ZeroThreads => write!(f, "threads must be greater than zero"),
             Self::InvalidSize(size) => {
                 write!(
                     f,
@@ -207,6 +216,86 @@ impl WorkingSet {
     }
 }
 
+/// One of the four benchmark kernels. Kept separate from [`Operation`] so the
+/// hot loops dispatch on a `Copy` value instead of a public enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    Read,
+    Write,
+    Copy,
+    PointerChase,
+}
+
+impl From<Op> for Operation {
+    fn from(op: Op) -> Self {
+        match op {
+            Op::Read => Self::Read,
+            Op::Write => Self::Write,
+            Op::Copy => Self::Copy,
+            Op::PointerChase => Self::PointerChase,
+        }
+    }
+}
+
+const OPERATIONS: [Op; 4] = [Op::Read, Op::Write, Op::Copy, Op::PointerChase];
+
+/// One thread's private view of a working set: its own buffers, and for the
+/// pointer chase its own ring and cursor. Per-thread buffers are the whole
+/// point of `--threads`: sharing one buffer across threads would measure
+/// contention on that buffer instead of the memory system behind it.
+struct Worker {
+    working_set: WorkingSet,
+    ring: Vec<usize>,
+    cursor: usize,
+}
+
+impl Worker {
+    fn new(words: usize, op: Op) -> Self {
+        let mut working_set = WorkingSet::new(words);
+        working_set.fill_source();
+        let ring = match op {
+            Op::PointerChase => make_pointer_chase_ring(words),
+            _ => Vec::new(),
+        };
+        Self {
+            working_set,
+            ring,
+            cursor: 0,
+        }
+    }
+
+    fn run(&mut self, op: Op, pass: usize) {
+        match op {
+            Op::Read => {
+                let checksum = std::hint::black_box(self.working_set.source())
+                    .iter()
+                    .copied()
+                    .fold(0_u64, u64::wrapping_add);
+                std::hint::black_box(checksum);
+                std::hint::black_box(pass);
+            }
+            Op::Write => {
+                self.working_set.destination_mut().fill(pass as u64);
+                std::hint::black_box(&self.working_set);
+            }
+            Op::Copy => {
+                self.working_set.copy();
+                std::hint::black_box(&self.working_set);
+                std::hint::black_box(pass);
+            }
+            Op::PointerChase => {
+                let ring = &self.ring;
+                let mut cursor = self.cursor;
+                for _ in 0..ring.len() {
+                    cursor = std::hint::black_box(ring[cursor]);
+                }
+                self.cursor = cursor;
+                std::hint::black_box(cursor);
+            }
+        }
+    }
+}
+
 pub fn run_suite(config: &BenchmarkConfig) -> Result<Vec<Measurement>, BenchmarkError> {
     if config.sizes_bytes.is_empty() {
         return Err(BenchmarkError::NoSizes);
@@ -214,91 +303,57 @@ pub fn run_suite(config: &BenchmarkConfig) -> Result<Vec<Measurement>, Benchmark
     if config.iterations == 0 {
         return Err(BenchmarkError::ZeroIterations);
     }
+    if config.threads == 0 {
+        return Err(BenchmarkError::ZeroThreads);
+    }
 
-    let mut measurements = Vec::with_capacity(config.sizes_bytes.len() * 4);
+    let mut measurements = Vec::with_capacity(config.sizes_bytes.len() * OPERATIONS.len());
     for &size_bytes in &config.sizes_bytes {
         if size_bytes < std::mem::size_of::<u64>() || !size_bytes.is_multiple_of(8) {
             return Err(BenchmarkError::InvalidSize(size_bytes));
         }
         let words = size_bytes / std::mem::size_of::<u64>();
-        let mut working_set = WorkingSet::new(words);
-        working_set.fill_source();
 
-        let (passes, elapsed) = timed(config, |pass| {
-            let checksum = std::hint::black_box(working_set.source())
-                .iter()
-                .copied()
-                .fold(0_u64, u64::wrapping_add);
-            std::hint::black_box(checksum);
-            std::hint::black_box(pass);
-        });
-        measurements.push(measurement(
-            Operation::Read,
-            size_bytes,
-            words,
-            passes,
-            elapsed,
-            size_bytes,
-        ));
+        for op in OPERATIONS {
+            let mut workers = (0..config.threads)
+                .map(|_| Worker::new(words, op))
+                .collect::<Vec<_>>();
 
-        let (passes, elapsed) = timed(config, |pass| {
-            working_set.destination_mut().fill(pass as u64);
-            std::hint::black_box(&working_set);
-        });
-        measurements.push(measurement(
-            Operation::Write,
-            size_bytes,
-            words,
-            passes,
-            elapsed,
-            size_bytes,
-        ));
+            let (passes, elapsed) = if workers.len() > 1 {
+                timed_parallel(config, &mut workers, op)
+            } else {
+                timed(config, &mut workers[0], op)
+            };
 
-        let (passes, elapsed) = timed(config, |pass| {
-            working_set.copy();
-            std::hint::black_box(&working_set);
-            std::hint::black_box(pass);
-        });
-        measurements.push(measurement(
-            Operation::Copy,
-            size_bytes,
-            words,
-            passes,
-            elapsed,
-            size_bytes.saturating_mul(2),
-        ));
-
-        let next = make_pointer_chase_ring(words);
-        let mut index = 0;
-        let (passes, elapsed) = timed(config, |_| {
-            for _ in 0..words {
-                index = std::hint::black_box(next[index]);
-            }
-        });
-        std::hint::black_box(index);
-        measurements.push(measurement(
-            Operation::PointerChase,
-            size_bytes,
-            words,
-            passes,
-            elapsed,
-            size_bytes,
-        ));
+            let transferred = match op {
+                Op::Copy => size_bytes.saturating_mul(2),
+                _ => size_bytes,
+            };
+            measurements.push(measurement(
+                op.into(),
+                size_bytes,
+                words,
+                passes,
+                elapsed,
+                transferred,
+                config.threads,
+            ));
+        }
     }
     Ok(measurements)
 }
 
-/// Runs `operation` once untimed to warm caches, branch predictors and the TLB,
+/// Runs `worker` once untimed to warm caches, branch predictors and the TLB,
 /// then repeats it until both `iterations` passes and `min_measure_seconds` of
 /// wall-clock time have been recorded. Returns the number of timed passes and
 /// the time they took.
-fn timed<F: FnMut(usize)>(config: &BenchmarkConfig, mut operation: F) -> (usize, Duration) {
-    operation(0);
+fn timed(config: &BenchmarkConfig, worker: &mut Worker, op: Op) -> (usize, Duration) {
+    worker.run(op, 0);
 
     let start = Timer::start();
     let mut passes = 0;
     loop {
-        operation(passes);
+        worker.run(op, passes);
         passes += 1;
         if passes >= config.iterations
             && start.elapsed().as_secs_f64() >= config.min_measure_seconds
@@ -308,26 +363,104 @@ fn timed<F: FnMut(usize)>(config: &BenchmarkConfig, mut operation: F) -> (usize,
     }
 }
 
+/// Drives every worker through the same work in lockstep, so the returned
+/// duration covers all of them at once and the reported throughput is the
+/// aggregate.
+///
+/// Workers are only re-synchronised every few milliseconds of work. Handing a
+/// pass across a barrier costs microseconds, so synchronising on every pass
+/// would dominate any working set small enough to be cache-resident and report
+/// a fraction of a GB/s for work that really takes nanoseconds.
+#[cfg(not(target_arch = "wasm32"))]
+fn timed_parallel(config: &BenchmarkConfig, workers: &mut [Worker], op: Op) -> (usize, Duration) {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// How much work to give each worker between two barrier hand-offs.
+    const STEP_SECONDS: f64 = 0.002;
+
+    // Time one pass per worker up front. This also faults in every page, so the
+    // timed loop never charges first-touch cost to the measurement.
+    let calibration = Timer::start();
+    for worker in workers.iter_mut() {
+        worker.run(op, 0);
+    }
+    let per_pass =
+        (calibration.elapsed().as_secs_f64() / workers.len() as f64).max(f64::MIN_POSITIVE);
+    let inner = ((STEP_SECONDS / per_pass).ceil() as usize).clamp(1, 1 << 20);
+
+    let gate = Barrier::new(workers.len() + 1);
+    let stop = AtomicBool::new(false);
+
+    std::thread::scope(|scope| {
+        for worker in workers.iter_mut() {
+            scope.spawn(|| {
+                let mut pass = 0;
+                loop {
+                    gate.wait();
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    for _ in 0..inner {
+                        worker.run(op, pass);
+                        pass = pass.wrapping_add(1);
+                    }
+                    gate.wait();
+                }
+            });
+        }
+
+        // Untimed warm-up, matching the single-threaded path.
+        gate.wait();
+        gate.wait();
+
+        let start = Timer::start();
+        let mut steps = 0usize;
+        let elapsed = loop {
+            gate.wait();
+            gate.wait();
+            steps += 1;
+            let elapsed = start.elapsed();
+            if steps.saturating_mul(inner) >= config.iterations
+                && elapsed.as_secs_f64() >= config.min_measure_seconds
+            {
+                break elapsed;
+            }
+        };
+
+        stop.store(true, Ordering::Relaxed);
+        // Releases the workers, which now see `stop` and leave the loop.
+        gate.wait();
+        (steps.saturating_mul(inner), elapsed)
+    })
+}
+
 fn measurement(
     operation: Operation,
     size_bytes: usize,
     elements_per_iteration: usize,
     iterations: usize,
-    elapsed: std::time::Duration,
+    elapsed: Duration,
     transferred_bytes_per_iteration: usize,
+    threads: usize,
 ) -> Measurement {
     let elapsed_seconds = elapsed.as_secs_f64().max(1e-9);
     let elapsed_for_division = elapsed_seconds.max(f64::MIN_POSITIVE);
-    let total_elements = elements_per_iteration.saturating_mul(iterations);
-    let total_bytes = transferred_bytes_per_iteration.saturating_mul(iterations);
+    let passes = elements_per_iteration
+        .saturating_mul(iterations)
+        .saturating_mul(threads);
+    let total_bytes = transferred_bytes_per_iteration
+        .saturating_mul(iterations)
+        .saturating_mul(threads);
 
     Measurement {
         operation,
         size_bytes,
         iterations,
+        threads,
         elapsed_seconds,
         bytes_per_second: total_bytes as f64 / elapsed_for_division,
-        nanoseconds_per_element: elapsed.as_nanos() as f64 / total_elements.max(1) as f64,
+        nanoseconds_per_element: elapsed.as_nanos() as f64 / passes.max(1) as f64,
     }
 }
 
@@ -373,10 +506,11 @@ mod wasm {
             .iter()
             .map(|result| {
                 format!(
-                    "{{\"operation\":\"{}\",\"size_bytes\":{},\"iterations\":{},\"elapsed_seconds\":{},\"bytes_per_second\":{},\"nanoseconds_per_element\":{}}}",
+                    "{{\"operation\":\"{}\",\"size_bytes\":{},\"iterations\":{},\"threads\":{},\"elapsed_seconds\":{},\"bytes_per_second\":{},\"nanoseconds_per_element\":{}}}",
                     result.operation.name(),
                     result.size_bytes,
                     result.iterations,
+                    result.threads,
                     result.elapsed_seconds,
                     result.bytes_per_second,
                     result.nanoseconds_per_element
@@ -449,13 +583,13 @@ mod tests {
             sizes_bytes: vec![4096],
             iterations: 1,
             min_measure_seconds: 0.05,
+            threads: 1,
         };
-        let mut calls = 0;
+        let mut worker = Worker::new(4096 / 8, Op::Read);
 
-        let (passes, elapsed) = timed(&config, |_| calls += 1);
+        let (passes, elapsed) = timed(&config, &mut worker, Op::Read);
 
-        // One untimed warm-up plus at least `iterations` timed passes.
-        assert_eq!(calls, passes + 1);
+        // One untimed warm-up precedes the timed passes.
         assert!(passes >= config.iterations);
         assert!(elapsed.as_secs_f64() >= config.min_measure_seconds);
     }
@@ -466,11 +600,70 @@ mod tests {
             sizes_bytes: vec![4096],
             iterations: 3,
             min_measure_seconds: 0.0,
+            threads: 1,
         };
+        let mut worker = Worker::new(4096 / 8, Op::Read);
 
-        let (passes, _) = timed(&config, |_| {});
+        let (passes, _) = timed(&config, &mut worker, Op::Read);
 
         assert_eq!(passes, 3);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn timed_parallel_reports_the_aggregate_across_workers() {
+        let config = BenchmarkConfig {
+            sizes_bytes: vec![4096],
+            iterations: 2,
+            min_measure_seconds: 0.05,
+            threads: 3,
+        };
+        let mut workers = (0..config.threads)
+            .map(|_| Worker::new(4096 / 8, Op::Read))
+            .collect::<Vec<_>>();
+
+        let (passes, elapsed) = timed_parallel(&config, &mut workers, Op::Read);
+
+        assert!(passes >= config.iterations);
+        assert!(elapsed.as_secs_f64() >= config.min_measure_seconds);
+        // Every worker must have done the same number of passes; a lost barrier
+        // hand-off would show up here as a thread that never ran.
+        for worker in &mut workers {
+            let before = worker.working_set.source()[0];
+            worker.run(Op::Read, 0);
+            assert_eq!(before, worker.working_set.source()[0]);
+        }
+    }
+
+    #[test]
+    fn suite_scales_reported_bytes_with_the_thread_count() {
+        let single = run_suite(&BenchmarkConfig {
+            sizes_bytes: vec![64 * 1024],
+            iterations: 1,
+            min_measure_seconds: 0.0,
+            threads: 1,
+        })
+        .unwrap();
+
+        let config = BenchmarkConfig {
+            sizes_bytes: vec![64 * 1024],
+            iterations: 1,
+            min_measure_seconds: 0.0,
+            threads: 3,
+        };
+        let parallel = run_suite(&config).unwrap();
+
+        assert!(parallel.iter().all(|item| item.threads == 3));
+        assert!(
+            parallel
+                .iter()
+                .all(|item| item.bytes_per_second.is_finite())
+        );
+        assert!(
+            parallel.iter().all(|item| item.bytes_per_second > 0.0),
+            "parallel runs reported no throughput"
+        );
+        assert_ne!(single.len(), 0);
     }
 
     #[test]
@@ -479,6 +672,7 @@ mod tests {
             sizes_bytes: vec![8, 64],
             iterations: 2,
             min_measure_seconds: 0.0,
+            threads: 1,
         })
         .unwrap();
 
@@ -530,6 +724,16 @@ mod tests {
             })
             .unwrap_err(),
             BenchmarkError::InvalidSize(7)
+        );
+        assert_eq!(
+            run_suite(&BenchmarkConfig {
+                sizes_bytes: vec![64],
+                iterations: 1,
+                threads: 0,
+                ..BenchmarkConfig::default()
+            })
+            .unwrap_err(),
+            BenchmarkError::ZeroThreads
         );
     }
 
