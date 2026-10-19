@@ -8,6 +8,9 @@ use std::time::Instant;
 /// timed for at least this long.
 pub const MIN_MEASURE_SECONDS: f64 = 0.05;
 
+const TIMED_BATCH_SECONDS: f64 = 0.002;
+const MAX_TIMED_BATCH_PASSES: usize = 1 << 20;
+
 #[derive(Clone, Debug)]
 pub struct BenchmarkConfig {
     pub sizes_bytes: Vec<usize>,
@@ -114,6 +117,7 @@ pub enum BenchmarkError {
     NoSizes,
     ZeroIterations,
     ZeroThreads,
+    InvalidMinMeasureSeconds,
     InvalidSize(usize),
 }
 
@@ -123,6 +127,12 @@ impl std::fmt::Display for BenchmarkError {
             Self::NoSizes => write!(f, "at least one working-set size is required"),
             Self::ZeroIterations => write!(f, "iterations must be greater than zero"),
             Self::ZeroThreads => write!(f, "threads must be greater than zero"),
+            Self::InvalidMinMeasureSeconds => {
+                write!(
+                    f,
+                    "minimum measurement duration must be finite and nonnegative"
+                )
+            }
             Self::InvalidSize(size) => {
                 write!(
                     f,
@@ -135,24 +145,20 @@ impl std::fmt::Display for BenchmarkError {
 
 impl std::error::Error for BenchmarkError {}
 
-const CACHE_LINE_BYTES: usize = 64;
-const PAGE_BYTES: usize = 4096;
-const WORDS_PER_CACHE_LINE: usize = CACHE_LINE_BYTES / std::mem::size_of::<u64>();
-const WORDS_PER_PAGE: usize = PAGE_BYTES / std::mem::size_of::<u64>();
+const CACHE_LINE_ALIGNMENT_BYTES: usize = 256;
+const PAGE_ALIGNMENT_BYTES: usize = 64 * 1024;
+const WORDS_PER_CACHE_LINE_ALIGNMENT: usize =
+    CACHE_LINE_ALIGNMENT_BYTES / std::mem::size_of::<u64>();
+const WORDS_PER_PAGE_ALIGNMENT: usize = PAGE_ALIGNMENT_BYTES / std::mem::size_of::<u64>();
 
 /// Source and destination for one working-set size, carved out of a single
 /// allocation so their relative offset is exact and independent of the
 /// allocator.
 ///
-/// The two halves are deliberately placed at the *same* offset within their
-/// page. `memcpy` streams the source and the destination in lockstep, and when
-/// the two disagree modulo 4096 every store and its paired load differ in the
-/// low address bits, so the memory system cannot disambiguate the streams and
-/// falls back to a much slower path. Letting the allocator hand out two
-/// back-to-back allocations instead produces a distance of `size + 16` bytes,
-/// which lands on a different page offset for every working set that is a
-/// multiple of 4 KiB. That one misaligned case measured about 20x slower below
-/// 64 KiB and 6x slower from 1 MiB upwards.
+/// The two halves are deliberately placed at the same offset within page sizes
+/// up to 64 KiB, and aligned to a conservative 256-byte cache-line boundary.
+/// Carving both out of one allocation makes their relative alignment
+/// deterministic without relying on allocator behavior.
 struct WorkingSet {
     buffer: Vec<u64>,
     source_start: usize,
@@ -164,13 +170,16 @@ impl WorkingSet {
     fn new(len: usize) -> Self {
         // One page of slack at minimum, then round the distance between the two
         // halves up to a whole number of pages.
-        let slack = WORDS_PER_PAGE + (WORDS_PER_PAGE - len % WORDS_PER_PAGE) % WORDS_PER_PAGE;
+        let slack = WORDS_PER_PAGE_ALIGNMENT
+            + (WORDS_PER_PAGE_ALIGNMENT - len % WORDS_PER_PAGE_ALIGNMENT)
+                % WORDS_PER_PAGE_ALIGNMENT;
         let capacity = len
             .saturating_mul(2)
-            .saturating_add(slack + WORDS_PER_CACHE_LINE);
+            .saturating_add(slack + WORDS_PER_CACHE_LINE_ALIGNMENT);
         let buffer = vec![0_u64; capacity];
         let base = buffer.as_ptr() as usize;
-        let source_start = (CACHE_LINE_BYTES - base % CACHE_LINE_BYTES) % CACHE_LINE_BYTES
+        let source_start = (CACHE_LINE_ALIGNMENT_BYTES - base % CACHE_LINE_ALIGNMENT_BYTES)
+            % CACHE_LINE_ALIGNMENT_BYTES
             / std::mem::size_of::<u64>();
         let destination_start = source_start + len + slack;
         Self {
@@ -182,7 +191,7 @@ impl WorkingSet {
     }
 
     /// Byte distance between the two halves. Always a non-zero multiple of
-    /// [`PAGE_BYTES`], so they share a page offset.
+    /// [`PAGE_ALIGNMENT_BYTES`], so they share a page offset.
     #[cfg(test)]
     fn separation_bytes(&self) -> usize {
         (self.destination_start - self.source_start) * std::mem::size_of::<u64>()
@@ -306,6 +315,9 @@ pub fn run_suite(config: &BenchmarkConfig) -> Result<Vec<Measurement>, Benchmark
     if config.threads == 0 {
         return Err(BenchmarkError::ZeroThreads);
     }
+    if !config.min_measure_seconds.is_finite() || config.min_measure_seconds < 0.0 {
+        return Err(BenchmarkError::InvalidMinMeasureSeconds);
+    }
 
     let mut measurements = Vec::with_capacity(config.sizes_bytes.len() * OPERATIONS.len());
     for &size_bytes in &config.sizes_bytes {
@@ -350,15 +362,34 @@ pub fn run_suite(config: &BenchmarkConfig) -> Result<Vec<Measurement>, Benchmark
 fn timed(config: &BenchmarkConfig, worker: &mut Worker, op: Op) -> (usize, Duration) {
     worker.run(op, 0);
 
+    if config.min_measure_seconds == 0.0 {
+        let start = Timer::start();
+        for pass in 0..config.iterations {
+            worker.run(op, pass);
+        }
+        return (config.iterations, start.elapsed());
+    }
+
+    let calibration = Timer::start();
+    worker.run(op, 0);
+    let per_pass = calibration.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+    let inner = ((TIMED_BATCH_SECONDS / per_pass).ceil() as usize).clamp(1, MAX_TIMED_BATCH_PASSES);
+
     let start = Timer::start();
     let mut passes = 0;
     loop {
-        worker.run(op, passes);
-        passes += 1;
-        if passes >= config.iterations
-            && start.elapsed().as_secs_f64() >= config.min_measure_seconds
-        {
-            return (passes, start.elapsed());
+        let batch = if passes < config.iterations {
+            inner.min(config.iterations - passes)
+        } else {
+            inner
+        };
+        for _ in 0..batch {
+            worker.run(op, passes);
+            passes += 1;
+        }
+        let elapsed = start.elapsed();
+        if passes >= config.iterations && elapsed.as_secs_f64() >= config.min_measure_seconds {
+            return (passes, elapsed);
         }
     }
 }
@@ -376,9 +407,6 @@ fn timed_parallel(config: &BenchmarkConfig, workers: &mut [Worker], op: Op) -> (
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// How much work to give each worker between two barrier hand-offs.
-    const STEP_SECONDS: f64 = 0.002;
-
     // Time one pass per worker up front. This also faults in every page, so the
     // timed loop never charges first-touch cost to the measurement.
     let calibration = Timer::start();
@@ -387,7 +415,7 @@ fn timed_parallel(config: &BenchmarkConfig, workers: &mut [Worker], op: Op) -> (
     }
     let per_pass =
         (calibration.elapsed().as_secs_f64() / workers.len() as f64).max(f64::MIN_POSITIVE);
-    let inner = ((STEP_SECONDS / per_pass).ceil() as usize).clamp(1, 1 << 20);
+    let inner = ((TIMED_BATCH_SECONDS / per_pass).ceil() as usize).clamp(1, MAX_TIMED_BATCH_PASSES);
 
     let gate = Barrier::new(workers.len() + 1);
     let stop = AtomicBool::new(false);
@@ -529,8 +557,7 @@ mod tests {
 
     #[test]
     fn working_set_halves_share_a_page_offset() {
-        // A separation that is not a multiple of 4096 bytes is what made `copy`
-        // run up to 20x slower, so pin the invariant down for page-aligned and
+        // Pin the conservative alignment invariant down for page-aligned and
         // unaligned working-set lengths alike.
         for len in [1, 2, 8, 511, 512, 513, 4096, 32_768, 100_000] {
             let mut working_set = WorkingSet::new(len);
@@ -538,23 +565,23 @@ mod tests {
             let destination = working_set.destination_mut().as_mut_ptr() as usize;
 
             assert_eq!(
-                working_set.separation_bytes() % PAGE_BYTES,
+                working_set.separation_bytes() % PAGE_ALIGNMENT_BYTES,
                 0,
                 "len {len} gives a separation of {} bytes",
                 working_set.separation_bytes()
             );
             assert_eq!(
-                source % PAGE_BYTES,
-                destination % PAGE_BYTES,
+                source % PAGE_ALIGNMENT_BYTES,
+                destination % PAGE_ALIGNMENT_BYTES,
                 "len {len} splits the halves across page offsets"
             );
             assert_eq!(
-                source % CACHE_LINE_BYTES,
+                source % CACHE_LINE_ALIGNMENT_BYTES,
                 0,
                 "len {len} source is not cache-line aligned"
             );
             assert_eq!(
-                destination % CACHE_LINE_BYTES,
+                destination % CACHE_LINE_ALIGNMENT_BYTES,
                 0,
                 "len {len} destination is not cache-line aligned"
             );
@@ -735,6 +762,17 @@ mod tests {
             .unwrap_err(),
             BenchmarkError::ZeroThreads
         );
+        for min_measure_seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1] {
+            assert_eq!(
+                run_suite(&BenchmarkConfig {
+                    sizes_bytes: vec![64],
+                    min_measure_seconds,
+                    ..BenchmarkConfig::default()
+                })
+                .unwrap_err(),
+                BenchmarkError::InvalidMinMeasureSeconds
+            );
+        }
     }
 
     #[test]

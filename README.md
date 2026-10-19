@@ -17,7 +17,7 @@ Choose working-set sizes around the cache capacities you want to investigate. Th
 
 Release builds target the generic architecture, so the vector width of `read` and `write` follows the baseline instruction set rather than the host CPU. Rebuild with `RUSTFLAGS="-C target-cpu=native"` to measure the widest vectors the local processor supports; on an AVX2 machine that is roughly 3x the read and write throughput of a default x86-64 build. The released binaries keep the portable baseline so they run on any machine of their architecture.
 
-`copy` places its source and destination at the same offset within their page and keeps them cache-line aligned. Anything else makes the two lockstep streams disagree in the low address bits, which measured about 20x slower below 64 KiB and 6x slower from 1 MiB upwards.
+`copy` places its source and destination at the same offset within page sizes up to 64 KiB, and aligns both to a conservative 256-byte cache-line boundary. This keeps the lockstep streams aligned across the supported platform page and cache-line sizes.
 
 ## Threads and memory bandwidth
 
